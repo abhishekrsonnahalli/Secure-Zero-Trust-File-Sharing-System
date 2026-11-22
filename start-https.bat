@@ -1,3 +1,6 @@
 @echo off
+setlocal
 cd /d "%~dp0"
-call "%~dp0start-demo.bat" --https
+set "USE_HTTPS=true"
+call "%~dp0start-demo.bat" --https %*
+exit /b %ERRORLEVEL%
