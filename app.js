@@ -127,10 +127,42 @@ $$('.demo-chip').forEach(chip => {
   });
 });
 
+function updateStorageQuotaDisplay(quota, usage) {
+  const usageEl = $('#storageUsageVal');
+  const quotaEl = $('#storageQuotaVal');
+  const percentEl = $('#storagePercentVal');
+  const barEl = $('#storageProgressBar');
+  if (!usageEl || !quotaEl) return;
+
+  const usedBytes = Number(usage) || 0;
+  usageEl.textContent = formatSize(usedBytes);
+
+  if (quota === 'unlimited' || quota === Infinity) {
+    quotaEl.textContent = 'Unlimited (Admin)';
+    if (percentEl) percentEl.textContent = 'Unlimited';
+    if (barEl) {
+      barEl.style.width = '100%';
+      barEl.style.background = 'var(--success)';
+    }
+  } else {
+    const quotaBytes = Number(quota) || (30 * 1024 * 1024);
+    quotaEl.textContent = formatSize(quotaBytes);
+    const pct = Math.min(100, Math.round((usedBytes / quotaBytes) * 100));
+    if (percentEl) percentEl.textContent = `${pct}%`;
+    if (barEl) {
+      barEl.style.width = `${pct}%`;
+      barEl.style.background = pct >= 90 ? 'var(--danger)' : (pct >= 75 ? '#e67e22' : 'var(--accent)');
+    }
+  }
+}
+
 function enterWorkspace(r) {
   token = r.token;
   me = r;
   clearLoginForm();
+  if (r.quota !== undefined && r.usage !== undefined) {
+    updateStorageQuotaDisplay(r.quota, r.usage);
+  }
 
   $('#login').hidden = true;
   $('#workspace').hidden = false;
@@ -414,7 +446,12 @@ async function toggleTamper(id, action) {
 async function refresh() {
   if (!token) return;
   try {
-    const { files, users } = await api('/api/files');
+    const data = await api('/api/files');
+    const files = data.files || [];
+    const users = data.users || [];
+    if (data.quota !== undefined && data.usage !== undefined) {
+      updateStorageQuotaDisplay(data.quota, data.usage);
+    }
     const container = $('#files');
     const emptyState = $('#empty');
 

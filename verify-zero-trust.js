@@ -18,6 +18,14 @@ const {
   db,
   sessions,
   loginRateLimits,
+  registrationRateLimits,
+  inflightUploads,
+  getInflightBytes,
+  sweepRateLimits,
+  sweepExpiredSessions,
+  getUserQuota,
+  getUserStorageUsage,
+  STORAGE_QUOTAS,
   createUser,
   listFiles,
   persist,
@@ -135,6 +143,7 @@ async function runTestSuite() {
     // ---------------------------------------------------------
     // Check 1b: User registration works with salted scrypt hashing
     // ---------------------------------------------------------
+    registrationRateLimits.clear();
     const regRes = await dispatch({
       method: 'POST',
       path: '/api/register',
@@ -152,6 +161,7 @@ async function runTestSuite() {
     // ---------------------------------------------------------
     // Check 1c: Privilege escalation prevention & Admin user management
     // ---------------------------------------------------------
+    registrationRateLimits.clear();
     // 1. Register with role: 'Admin' -> HTTP 403
     const regAdmin = await dispatch({
       method: 'POST',
@@ -312,6 +322,7 @@ async function runTestSuite() {
     // ---------------------------------------------------------
     // Check 1e: Audit log CRLF injection protection & malformed JSON handling
     // ---------------------------------------------------------
+    registrationRateLimits.clear();
     // 1. Log injection attempt via CRLF in role parameter
     const initialLogCount = (adminActivity.data.logs || []).length;
     const crlfInjectionRes = await dispatch({
@@ -349,6 +360,7 @@ async function runTestSuite() {
     // ---------------------------------------------------------
     // Check 1f: Registration role own-property edge cases
     // ---------------------------------------------------------
+    registrationRateLimits.clear();
     // 1. Role omitted -> HTTP 201, Student
     const regOmitted = await dispatch({
       method: 'POST',
@@ -382,6 +394,7 @@ async function runTestSuite() {
     const edge4 = regExpFaculty.status === 403 && !regExpFaculty.data.token && !db.users['edge_faculty'];
 
     // 5. Explicit null -> HTTP 403
+    registrationRateLimits.clear();
     const regExpNull = await dispatch({
       method: 'POST',
       path: '/api/register',
@@ -406,6 +419,7 @@ async function runTestSuite() {
     const edge7 = regExpWhitespace.status === 403 && !regExpWhitespace.data.token && !db.users['edge_ws'];
 
     // 8. Explicit numeric or boolean role -> HTTP 403
+    registrationRateLimits.clear();
     const regExpNum = await dispatch({
       method: 'POST',
       path: '/api/register',
@@ -629,9 +643,48 @@ async function runTestSuite() {
     const spoofAttempt = await login(rlUser, 'badpass', testIpA, { 'x-forwarded-for': '203.0.113.195' });
     const subI8_xffBlocked = spoofAttempt.status === 429 && String(spoofAttempt.headers['retry-after']) === '60';
 
-    const check1iPassed = subI1 && subI2 && subI3 && subI4 && subI5 && subI6_userIso && subI7 && subI8_xffBlocked;
+    // 9. Sliding-window persistence: failed attempts survive lockout expiration until 15-minute window expires
+    const slidingUser = 'rl_sliding_win_user';
+    createUser(slidingUser, 'goodpassword123', 'Student');
+    for (let i = 1; i <= 5; i++) {
+      await login(slidingUser, `bad_${i}`, testIpA);
+    }
+    const winEntry = loginRateLimits.get(`${slidingUser}|${testIpA}`);
+    const winLocked = winEntry && winEntry.lockUntil > Date.now();
+
+    // Fast-forward past the 60-second lockout: attempts are still unexpired (< 15 min old)
+    if (winEntry) winEntry.lockUntil = Date.now() - 1000;
+
+    // A single subsequent failed attempt after lockout expiration immediately re-establishes lock
+    const failAfterLockExpiry = await login(slidingUser, 'bad_after_lock', testIpA);
+    const winEntryReLocked = loginRateLimits.get(`${slidingUser}|${testIpA}`);
+    const subI9_survives = failAfterLockExpiry.status === 401 &&
+                           winEntryReLocked?.failures >= 5 &&
+                           winEntryReLocked?.lockUntil > Date.now();
+
+    // 7th attempt is rejected with HTTP 429
+    const fail7 = await login(slidingUser, 'bad_7', testIpA);
+    const subI9_reLocked429 = fail7.status === 429 && String(fail7.headers['retry-after']) === '60';
+
+    // When the 15-minute sliding window expires, old attempts decay
+    if (winEntryReLocked) {
+      winEntryReLocked.attempts = [Date.now() - (16 * 60 * 1000)];
+      winEntryReLocked.lockUntil = 0;
+    }
+    const failAfter15m = await login(slidingUser, 'bad_after_15m', testIpA);
+    const entryAfter15m = loginRateLimits.get(`${slidingUser}|${testIpA}`);
+    const subI9_pruned = failAfter15m.status === 401 && entryAfter15m?.failures === 1 && entryAfter15m?.lockUntil === 0;
+
+    // Successful login clears the record
+    const goodLoginAfterDecay = await login(slidingUser, 'goodpassword123', testIpA);
+    const subI9_cleared = goodLoginAfterDecay.status === 200 && !loginRateLimits.has(`${slidingUser}|${testIpA}`);
+
+    delete db.users[slidingUser];
+
+    const check1iPassed = subI1 && subI2 && subI3 && subI4 && subI5 && subI6_userIso && subI7 && subI8_xffBlocked &&
+                          winLocked && subI9_survives && subI9_reLocked429 && subI9_pruned && subI9_cleared;
     record('1i', 'Login rate limiting, lockout threshold, and IP/user isolation', check1iPassed,
-      `4 failed attempts allowed (HTTP 401), 5th failed attempt established 60-second lock (HTTP 401), 6th attempt returned HTTP 429 with confirmed "Retry-After: 60" header. Lock checked before scrypt (correct password returned 429 with Retry-After: 60 while locked). Successful login cleared only matching counter. Independent counters for different users on same IP verified. Unknown usernames locked identically without account enumeration. X-Forwarded-For spoofing rejected (socket remote address enforced).`);
+      `4 failed attempts allowed (HTTP 401), 5th failed attempt established 60-second lock (HTTP 401), 6th attempt returned HTTP 429 with confirmed "Retry-After: 60" header. Lock checked before scrypt (correct password returned 429 with Retry-After: 60 while locked). Successful login cleared only matching counter. Independent counters for different users on same IP verified. Unknown usernames locked identically without account enumeration. X-Forwarded-For spoofing rejected (socket remote address enforced). Sliding window persistence verified: failed attempts survive lockout expiration until 15-minute decay.`);
 
     // ---------------------------------------------------------
     // Check 1j: Classroom demo accounts box and credentials integrity
@@ -1096,6 +1149,492 @@ async function runTestSuite() {
 
     record(10, 'Secure file deletion authorization, cleanup, and transaction safety', check10Passed,
       `All 10 deletion security requirements verified: Owner can delete own file (HTTP 200), Student denied deleting another's file (HTTP 403), Faculty denied deleting another's file (HTTP 403), Admin denied deleting another's private file (HTTP 403), shared recipient denied deleting original file (HTTP 403), deleted files rejected on download (HTTP 404), encrypted .aes blob removed from disk, metadata and sharing ACLs purged, audit log recorded ALLOW/DENY events without data leakage, and failed disk operations rolled back safely leaving consistent storage.`);
+
+    // ---------------------------------------------------------
+    // Check 11: Task 1 — Generic HTTP 500 Responses & Exception Masking
+    // ---------------------------------------------------------
+    const secretPathLeak = 'C:\\Confidential\\System\\Path\\leak-key.pem';
+    let intercepted500 = false;
+    let noPathLeak = false;
+    let consoleErrorCalled = false;
+
+    const originalConsoleError = console.error;
+    try {
+      console.error = (...args) => {
+        if (args.some(a => String(a).includes('SIMULATED_INTERNAL_FAULT'))) {
+          consoleErrorCalled = true;
+        }
+      };
+
+      const ashaLoginFor500 = await login('asha', 'asha123');
+      const ashaTokenFor500 = ashaLoginFor500.data.token;
+
+      // Temporarily simulate an internal exception during a request
+      const origFiles = db.files;
+      Object.defineProperty(db, 'files', {
+        get() {
+          const err = new Error(`SIMULATED_INTERNAL_FAULT: Database disk read failure at ${secretPathLeak}`);
+          throw err;
+        },
+        configurable: true
+      });
+
+      const res500 = await dispatch({
+        method: 'GET',
+        path: '/api/files',
+        headers: { authorization: `Bearer ${ashaTokenFor500}` }
+      });
+
+      Object.defineProperty(db, 'files', {
+        value: origFiles,
+        writable: true,
+        configurable: true
+      });
+
+      intercepted500 = res500.status === 500 && res500.data.error === 'Internal server error.';
+      noPathLeak = !res500.raw.includes(secretPathLeak) && !res500.raw.includes('SIMULATED_INTERNAL_FAULT');
+    } finally {
+      console.error = originalConsoleError;
+      if (Object.getOwnPropertyDescriptor(db, 'files')?.get) {
+        Object.defineProperty(db, 'files', { value: {}, writable: true, configurable: true });
+      }
+    }
+
+    // Verify expected client errors (400, 401, 403, 404, 413) preserve their status codes and messages
+    const badJsonRes = await dispatch({
+      method: 'POST',
+      path: '/api/login',
+      body: '{"invalid_json'
+    });
+    const preserved400 = badJsonRes.status === 400 && badJsonRes.data.error === 'Invalid JSON payload.';
+
+    const check11Passed = intercepted500 && noPathLeak && consoleErrorCalled && preserved400;
+    record(11, 'Generic HTTP 500 responses and internal exception detail masking', check11Passed,
+      `Uncaught server exceptions return HTTP 500 with generic message "Internal server error." (raw internal message and path "${secretPathLeak}" were strictly masked). Server-side console.error recorded the fault. Expected client errors (HTTP 400 "${badJsonRes.data.error}") were appropriately preserved.`);
+
+    // ---------------------------------------------------------
+    // Check 12: Task 2 — Security Headers & CSP Enforcement
+    // ---------------------------------------------------------
+    const expectedCsp = "default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'";
+    const expectedXfo = 'DENY';
+    const expectedRef = 'no-referrer';
+
+    const htmlRes = await dispatch({ method: 'GET', path: '/' });
+    const h1 = htmlRes.headers['content-security-policy'] === expectedCsp &&
+               htmlRes.headers['x-frame-options'] === expectedXfo &&
+               htmlRes.headers['referrer-policy'] === expectedRef &&
+               htmlRes.headers['x-content-type-options'] === 'nosniff' &&
+               htmlRes.headers['cache-control'] === 'no-store';
+
+    const jsRes = await dispatch({ method: 'GET', path: '/app.js' });
+    const h2 = jsRes.headers['content-security-policy'] === expectedCsp &&
+               jsRes.headers['x-frame-options'] === expectedXfo &&
+               jsRes.headers['referrer-policy'] === expectedRef;
+
+    const cssRes = await dispatch({ method: 'GET', path: '/style.css' });
+    const h3 = cssRes.headers['content-security-policy'] === expectedCsp &&
+               cssRes.headers['x-frame-options'] === expectedXfo &&
+               cssRes.headers['referrer-policy'] === expectedRef;
+
+    const apiRes = await dispatch({ method: 'GET', path: '/api/transport' });
+    const h4 = apiRes.headers['content-security-policy'] === expectedCsp &&
+               apiRes.headers['x-frame-options'] === expectedXfo &&
+               apiRes.headers['referrer-policy'] === expectedRef;
+
+    const check12Passed = h1 && h2 && h3 && h4;
+    record(12, 'Comprehensive HTTP security headers and Content-Security-Policy enforcement', check12Passed,
+      `All frontend assets (HTML, JS, CSS) and API responses consistently received CSP ("${expectedCsp}"), X-Frame-Options ("${expectedXfo}"), Referrer-Policy ("${expectedRef}"), nosniff, and no-store headers.`);
+
+    // ---------------------------------------------------------
+    // Check 13: Task 3 — Registration Rate Limiting, Sliding Window & IP Isolation
+    // ---------------------------------------------------------
+    registrationRateLimits.clear();
+    const testRegIp = '198.51.100.42';
+    const otherRegIp = '198.51.100.99';
+
+    const regResults = [];
+    for (let i = 1; i <= 5; i++) {
+      const res = await dispatch({
+        method: 'POST',
+        path: '/api/register',
+        body: { username: `rate_user_${i}`, password: 'password123' },
+        remoteAddress: testRegIp
+      });
+      regResults.push(res.status);
+    }
+    const fiveRegAllowed = regResults.every(s => s === 201);
+
+    const reg6 = await dispatch({
+      method: 'POST',
+      path: '/api/register',
+      body: { username: 'rate_user_6', password: 'password123' },
+      remoteAddress: testRegIp
+    });
+    const reg6Blocked = reg6.status === 429 &&
+                        reg6.headers['retry-after'] !== undefined &&
+                        reg6.data.error.includes('Too many registration attempts');
+
+    const regBlockedMalformed = await dispatch({
+      method: 'POST',
+      path: '/api/register',
+      body: { username: '', password: '' },
+      remoteAddress: testRegIp
+    });
+    const rejectedBeforeValidation = regBlockedMalformed.status === 429;
+
+    const otherIpReg = await dispatch({
+      method: 'POST',
+      path: '/api/register',
+      body: { username: 'other_ip_user', password: 'password123' },
+      remoteAddress: otherRegIp
+    });
+    const otherIpAllowed = otherIpReg.status === 201;
+
+    // Simulate window expiry for testRegIp
+    const regEntries = registrationRateLimits.get(testRegIp);
+    if (regEntries) {
+      for (let i = 0; i < regEntries.length; i++) {
+        regEntries[i] = Date.now() - 70_000;
+      }
+    }
+    sweepRateLimits();
+    const sweptClean = !registrationRateLimits.has(testRegIp);
+
+    const regAfterExpiry = await dispatch({
+      method: 'POST',
+      path: '/api/register',
+      body: { username: 'rate_user_recovered', password: 'password123' },
+      remoteAddress: testRegIp
+    });
+    const recoveredOk = regAfterExpiry.status === 201;
+
+    const check13Passed = fiveRegAllowed && reg6Blocked && rejectedBeforeValidation && otherIpAllowed && sweptClean && recoveredOk;
+    record(13, 'Registration rate limiting (5 req/60s), sliding window decay, and periodic sweep', check13Passed,
+      `5 registration attempts accepted from ${testRegIp}, 6th attempt rejected with HTTP 429 (Retry-After: ${reg6.headers['retry-after']}s). Rate limit enforced before validation/scrypt. Independent IP (${otherRegIp}) unaffected. Expired entries pruned by sweepRateLimits(), and rate limit recovered automatically after window expiration.`);
+
+    // ---------------------------------------------------------
+    // Check 14: Task 4 — Session Cleanup Mechanism
+    // ---------------------------------------------------------
+    const activeToken = crypto.randomBytes(32).toString('hex');
+    const expiredToken = crypto.randomBytes(32).toString('hex');
+
+    sessions.set(activeToken, { username: 'asha', role: 'Student', loginTime: Date.now() });
+    sessions.set(expiredToken, { username: 'rao', role: 'Faculty', loginTime: Date.now() - (35 * 60 * 1000) });
+
+    sweepExpiredSessions();
+
+    const activePreserved = sessions.has(activeToken);
+    const expiredPruned = !sessions.has(expiredToken);
+
+    const activeReq = await dispatch({
+      method: 'GET',
+      path: '/api/me',
+      headers: { authorization: `Bearer ${activeToken}` }
+    });
+    const expiredReq = await dispatch({
+      method: 'GET',
+      path: '/api/me',
+      headers: { authorization: `Bearer ${expiredToken}` }
+    });
+
+    const activeWorks = activeReq.status === 200 && activeReq.data.username === 'asha';
+    const expiredFails = expiredReq.status === 401;
+
+    sessions.delete(activeToken);
+
+    const check14Passed = activePreserved && expiredPruned && activeWorks && expiredFails;
+    record(14, 'Periodic session cleanup mechanism and expired token purging', check14Passed,
+      `sweepExpiredSessions() purged expired session (${expiredToken.slice(0, 8)}..., 35m old) while retaining active session (${activeToken.slice(0, 8)}...). Expired session returned HTTP 401; active session verified HTTP 200.`);
+
+    // ---------------------------------------------------------
+    // Check 15: Task 5 — Role-Based Storage Quotas & Atomic Enforcement
+    // ---------------------------------------------------------
+    const studentQuota = STORAGE_QUOTAS.Student;
+    const facultyQuota = STORAGE_QUOTAS.Faculty;
+    const adminQuota = STORAGE_QUOTAS.Admin;
+
+    const quotasCorrect = studentQuota === 30 * 1024 * 1024 &&
+                          facultyQuota === 150 * 1024 * 1024 &&
+                          adminQuota === Infinity;
+
+    const ashaLoginQuota = await login('asha', 'asha123');
+    const ashaTokenQuota = ashaLoginQuota.data.token;
+    const ashaInitialUsage = getUserStorageUsage('asha');
+
+    const meRes = await dispatch({
+      method: 'GET',
+      path: '/api/me',
+      headers: { authorization: `Bearer ${ashaTokenQuota}` }
+    });
+    const quotaInfoAccurate = meRes.data.quota === studentQuota && meRes.data.usage === ashaInitialUsage;
+
+    const adminLoginQuota = await login('admin', 'admin123');
+    const adminMeRes = await dispatch({
+      method: 'GET',
+      path: '/api/me',
+      headers: { authorization: `Bearer ${adminLoginQuota.data.token}` }
+    });
+    const adminUnlimitedAccurate = adminMeRes.data.quota === 'unlimited';
+
+    createUser('quota_test_student', 'password123', 'Student');
+    const studentLoginQ = await login('quota_test_student', 'password123');
+    const studentTokenQ = studentLoginQ.data.token;
+
+    const dummyFileId = 'dummy-quota-fill-id';
+    db.files[dummyFileId] = {
+      id: dummyFileId,
+      name: 'large-existing-file.dat',
+      diskName: 'nonexistent.aes',
+      owner: 'quota_test_student',
+      ownerRole: 'Student',
+      size: (30 * 1024 * 1024) - 50,
+      sharedWith: []
+    };
+    persist();
+
+    const testContent200B = Buffer.alloc(200, 'Z').toString('base64');
+    const quotaExceededRes = await dispatch({
+      method: 'POST',
+      path: '/api/files',
+      headers: { authorization: `Bearer ${studentTokenQ}` },
+      body: { name: 'overflow.txt', content: testContent200B }
+    });
+
+    const quotaRejected413 = quotaExceededRes.status === 413 &&
+                             quotaExceededRes.data.error.includes('Upload exceeds storage quota');
+
+    const noOrphanedRecord = !Object.values(db.files).some(f => f.name === 'overflow.txt');
+
+    db.files[dummyFileId].sharedWith = ['asha'];
+    persist();
+    const ashaUsageAfterShare = getUserStorageUsage('asha');
+    const sharedNotCounted = ashaUsageAfterShare === ashaInitialUsage;
+
+    delete db.files[dummyFileId];
+    persist();
+
+    const legitContent = Buffer.from('Small valid text file under quota').toString('base64');
+    const legitUploadRes = await dispatch({
+      method: 'POST',
+      path: '/api/files',
+      headers: { authorization: `Bearer ${studentTokenQ}` },
+      body: { name: 'legit.txt', content: legitContent }
+    });
+    const legitOk = legitUploadRes.status === 201 && legitUploadRes.data.file;
+
+    if (legitUploadRes.data.file?.id) {
+      await dispatch({
+        method: 'DELETE',
+        path: `/api/files/${legitUploadRes.data.file.id}`,
+        headers: { authorization: `Bearer ${studentTokenQ}` }
+      });
+    }
+    const finalUsage = getUserStorageUsage('quota_test_student');
+    const quotaRestored = finalUsage === 0;
+
+    delete db.users['quota_test_student'];
+    persist();
+
+    const check15Passed = quotasCorrect && quotaInfoAccurate && adminUnlimitedAccurate &&
+                          quotaRejected413 && noOrphanedRecord && sharedNotCounted && legitOk && quotaRestored;
+
+    record(15, 'Role-based cumulative storage quotas (Student: 30MB, Faculty: 150MB, Admin: Unlimited)', check15Passed,
+      `Quotas verified: Student (30 MB), Faculty (150 MB), Admin (Unlimited). Over-quota upload rejected with HTTP 413 without leaving orphaned files. Shared files excluded from recipient quota calculations. File deletion successfully restored quota headroom.`);
+
+    // ---------------------------------------------------------
+    // Check 16: Code Review Corrections — Login Sliding Window Persistence, Fail-Closed Quotas & Upload Rollback
+    // ---------------------------------------------------------
+    // 1. Finding 1: Login Sliding-Window Persistence
+    // Expired 60s lockouts must not erase unexpired failed-attempt timestamps.
+    const crUser = 'cr_sliding_user';
+    const crIp = '198.51.100.77';
+    createUser(crUser, 'passCorrect123', 'Student');
+    for (let i = 1; i <= 5; i++) {
+      await login(crUser, `wrongPass_${i}`, crIp);
+    }
+    const crRecord1 = loginRateLimits.get(`${crUser}|${crIp}`);
+    const crInitiallyLocked = crRecord1 && crRecord1.lockUntil > Date.now() && crRecord1.failures === 5;
+
+    // Simulate lockout expiry at t = 65s (attempts are only 65s old, well inside 15m window)
+    if (crRecord1) crRecord1.lockUntil = Date.now() - 1000;
+
+    // 6th attempt with bad password must immediately trigger lock again without needing 5 fresh attempts
+    const cr6 = await login(crUser, 'wrongPass_6', crIp);
+    const crRecord2 = loginRateLimits.get(`${crUser}|${crIp}`);
+    const crReLockedImmediately = cr6.status === 401 &&
+                                  crRecord2?.failures >= 5 &&
+                                  crRecord2?.lockUntil > Date.now();
+
+    // 7th attempt returns HTTP 429 Retry-After: 60
+    const cr7 = await login(crUser, 'wrongPass_7', crIp);
+    const cr7Blocked429 = cr7.status === 429 && String(cr7.headers['retry-after']) === '60';
+
+    // Successful authentication clears the appropriate user's failure record
+    if (crRecord2) crRecord2.lockUntil = Date.now() - 1000;
+    const crGoodLogin = await login(crUser, 'passCorrect123', crIp);
+    const crRecordClearedOnSuccess = crGoodLogin.status === 200 && !loginRateLimits.has(`${crUser}|${crIp}`);
+
+    delete db.users[crUser];
+
+    // 2. Finding 2: Make storage quota calculation fail closed
+    const crQuotaUser = 'cr_fail_closed_user';
+    createUser(crQuotaUser, 'quotaPass123', 'Student');
+    const crQuotaLogin = await login(crQuotaUser, 'quotaPass123');
+    const crQuotaToken = crQuotaLogin.data.token;
+
+    // Test malformed sizes: negative, non-integer, missing/undefined, null, string, NaN, Infinity
+    const malformedSizes = [-100, 12.345, undefined, null, '5000', NaN, Infinity];
+    let allMalformedFailedClosed = true;
+
+    for (const badSize of malformedSizes) {
+      const corruptFileId = `corrupt-${crypto.randomUUID()}`;
+      db.files[corruptFileId] = {
+        id: corruptFileId,
+        name: 'corrupt-entry.dat',
+        diskName: `${corruptFileId}.aes`,
+        owner: crQuotaUser,
+        ownerRole: 'Student',
+        size: badSize,
+        sharedWith: []
+      };
+
+      // getUserStorageUsage must throw INVALID_METADATA error
+      let threwExpected = false;
+      try {
+        getUserStorageUsage(crQuotaUser);
+      } catch (err) {
+        threwExpected = err && err.code === 'INVALID_METADATA';
+      }
+
+      // POST /api/files must reject upload with HTTP 500
+      const uploadAttempt = await dispatch({
+        method: 'POST',
+        path: '/api/files',
+        headers: { authorization: `Bearer ${crQuotaToken}` },
+        body: { name: 'blocked-by-corruption.txt', content: Buffer.from('hello').toString('base64') }
+      });
+
+      const blocked500 = uploadAttempt.status === 500 &&
+                         uploadAttempt.data.error.includes('Storage quota verification failed');
+
+      if (!threwExpected || !blocked500) {
+        allMalformedFailedClosed = false;
+      }
+
+      delete db.files[corruptFileId];
+    }
+
+    // Verify valid metadata enforcement
+    const validUsage = getUserStorageUsage(crQuotaUser);
+    const validUsageCorrect = validUsage === 0;
+
+    // Valid upload succeeds under normal conditions
+    const validUploadRes = await dispatch({
+      method: 'POST',
+      path: '/api/files',
+      headers: { authorization: `Bearer ${crQuotaToken}` },
+      body: { name: 'valid-test.txt', content: Buffer.from('Valid content').toString('base64') }
+    });
+    const validUploadOk = validUploadRes.status === 201 && validUploadRes.data.file;
+
+    // Clean up valid file
+    if (validUploadRes.data.file?.id) {
+      await dispatch({
+        method: 'DELETE',
+        path: `/api/files/${validUploadRes.data.file.id}`,
+        headers: { authorization: `Bearer ${crQuotaToken}` }
+      });
+    }
+    delete db.users[crQuotaUser];
+    persist();
+
+    // 3. Finding 3: Make failed uploads rollback safely
+    const crRollbackUser = 'cr_rollback_user';
+    createUser(crRollbackUser, 'rollbackPass123', 'Student');
+    const crRollbackLogin = await login(crRollbackUser, 'rollbackPass123');
+    const crRollbackToken = crRollbackLogin.data.token;
+
+    // Snapshot storage directory and db.files before simulating failure
+    const storeFilesBefore = new Set(fs.readdirSync(STORE));
+    const dbFileKeysBefore = new Set(Object.keys(db.files));
+
+    // Simulate a failure during metadata persistence after ciphertext creation
+    const origRenameSync = fs.renameSync;
+    let failRenameCount = 1;
+    let simulatedFailureOccurred = false;
+
+    fs.renameSync = function(oldPath, newPath) {
+      if (failRenameCount > 0 && typeof newPath === 'string' && newPath.endsWith('metadata.json')) {
+        failRenameCount--;
+        simulatedFailureOccurred = true;
+        throw new Error('SIMULATED_METADATA_PERSISTENCE_DISK_FAILURE');
+      }
+      return origRenameSync.apply(this, arguments);
+    };
+
+    let doomedUploadRes;
+    const origConsoleError = console.error;
+    try {
+      console.error = () => {};
+      doomedUploadRes = await dispatch({
+        method: 'POST',
+        path: '/api/files',
+        headers: { authorization: `Bearer ${crRollbackToken}` },
+        body: { name: 'doomed-file.txt', content: Buffer.from('Doomed content to be rolled back').toString('base64') }
+      });
+    } finally {
+      console.error = origConsoleError;
+      fs.renameSync = origRenameSync;
+    }
+
+    const uploadRejected500 = doomedUploadRes.status === 500 &&
+                              doomedUploadRes.data.error.includes('Internal server error');
+
+    // Verify zero orphaned files left in STORE
+    const storeFilesAfter = fs.readdirSync(STORE);
+    const orphanedFiles = storeFilesAfter.filter(f => !storeFilesBefore.has(f));
+    const zeroOrphanedFiles = orphanedFiles.length === 0;
+
+    // Verify metadata was restored and clean in-memory
+    const dbFileKeysAfter = Object.keys(db.files);
+    const zeroOrphanedMetadata = dbFileKeysAfter.length === dbFileKeysBefore.size &&
+                                 dbFileKeysAfter.every(k => dbFileKeysBefore.has(k));
+
+    // Verify metadata on disk is clean and matches in-memory
+    const diskDb = JSON.parse(fs.readFileSync(path.join(STORE, 'metadata.json'), 'utf8'));
+    const diskMetadataClean = Object.keys(diskDb.files).length === dbFileKeysBefore.size;
+
+    // Verify in-flight quota bytes were fully released
+    const inflightAfter = getInflightBytes(crRollbackUser);
+    const inflightReleased = inflightAfter === 0;
+
+    // Verify subsequent upload works normally after rollback
+    const postRollbackUpload = await dispatch({
+      method: 'POST',
+      path: '/api/files',
+      headers: { authorization: `Bearer ${crRollbackToken}` },
+      body: { name: 'healthy-after-rollback.txt', content: Buffer.from('Clean content').toString('base64') }
+    });
+    const postRollbackHealthy = postRollbackUpload.status === 201 && postRollbackUpload.data.file;
+
+    if (postRollbackUpload.data.file?.id) {
+      await dispatch({
+        method: 'DELETE',
+        path: `/api/files/${postRollbackUpload.data.file.id}`,
+        headers: { authorization: `Bearer ${crRollbackToken}` }
+      });
+    }
+    delete db.users[crRollbackUser];
+    persist();
+
+    const finding1Passed = crInitiallyLocked && crReLockedImmediately && cr7Blocked429 && crRecordClearedOnSuccess;
+    const finding2Passed = allMalformedFailedClosed && validUsageCorrect && validUploadOk;
+    const finding3Passed = simulatedFailureOccurred && uploadRejected500 && zeroOrphanedFiles &&
+                           zeroOrphanedMetadata && diskMetadataClean && inflightReleased && postRollbackHealthy;
+
+    const check16Passed = finding1Passed && finding2Passed && finding3Passed;
+    record(16, 'Code Review Corrections: Sliding Window Persistence, Fail-Closed Quotas & Upload Rollback', check16Passed,
+      `Finding 1: Failed login attempts survived lockout expiration until 15m window decayed; immediate re-lock confirmed; cleared on success. Finding 2: Malformed metadata (negative/float/null/string/NaN) failed closed with HTTP 500; valid quota enforcement intact. Finding 3: Persistence failure after ciphertext creation triggered automatic transactional rollback (0 orphaned files, restored metadata, freed in-flight quota bytes).`);
 
   } catch (err) {
     console.error('Test suite encountered an unexpected error:', err);

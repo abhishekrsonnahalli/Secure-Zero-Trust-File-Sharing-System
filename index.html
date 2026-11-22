@@ -152,6 +152,17 @@
           <h2>Upload Encrypted File</h2>
           <p>Files are hashed with SHA-256, then encrypted with <b>AES-256-GCM</b> using a fresh random IV. Plaintext never reaches the disk.</p>
           
+          <!-- Storage Quota Widget -->
+          <div class="storage-quota-widget" id="storageQuotaWidget" style="margin: 12px 0 16px; padding: 12px 14px; background: var(--bg-page); border: 1px solid var(--border); border-radius: 8px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; font-size: 13px;">
+              <span><b>Storage Usage:</b> <span id="storageUsageVal">0 B</span> / <span id="storageQuotaVal">30 MB</span></span>
+              <span id="storagePercentVal" class="muted" style="font-size: 12px;">0%</span>
+            </div>
+            <div style="background: var(--border); border-radius: 4px; height: 6px; overflow: hidden;">
+              <div id="storageProgressBar" style="width: 0%; height: 100%; background: var(--accent); transition: width 0.3s ease;"></div>
+            </div>
+          </div>
+
           <div class="drop-zone">
             <label class="filepick">
               <span>Choose File</span>

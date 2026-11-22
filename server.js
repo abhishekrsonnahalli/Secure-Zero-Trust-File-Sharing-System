@@ -19,10 +19,112 @@ if (!fs.existsSync(KEY_FILE)) {
   fs.writeFileSync(KEY_FILE, key, { mode: 0o600 });
 }
 
-// In-memory sessions, audit log buffer, and login rate limiting
+// In-memory sessions, audit log buffer, rate limiting, and quota tracking
 const sessions = new Map();
 const auditLogs = [];
 const loginRateLimits = new Map();
+const registrationRateLimits = new Map();
+const inflightUploads = new Map();
+
+const REGISTRATION_WINDOW_MS = 60_000;
+const REGISTRATION_MAX_ATTEMPTS = 5;
+const LOGIN_WINDOW_MS = 15 * 60_000;
+
+const STORAGE_QUOTAS = {
+  Student: 30 * 1024 * 1024,
+  Faculty: 150 * 1024 * 1024,
+  Admin: Infinity
+};
+
+function getClientIp(req) {
+  const raw = (req.socket && req.socket.remoteAddress) ? String(req.socket.remoteAddress).trim() : '127.0.0.1';
+  if (raw === '::1' || raw === '::ffff:127.0.0.1') return '127.0.0.1';
+  if (raw.startsWith('::ffff:')) return raw.slice(7);
+  return raw || '127.0.0.1';
+}
+
+function checkRegistrationRateLimit(ip) {
+  const now = Date.now();
+  let attempts = registrationRateLimits.get(ip);
+  if (!Array.isArray(attempts)) {
+    attempts = [];
+  }
+  attempts = attempts.filter(ts => (now - ts) < REGISTRATION_WINDOW_MS);
+  registrationRateLimits.set(ip, attempts);
+
+  if (attempts.length >= REGISTRATION_MAX_ATTEMPTS) {
+    const oldest = attempts[0];
+    const retryAfter = Math.max(1, Math.ceil((oldest + REGISTRATION_WINDOW_MS - now) / 1000));
+    return { allowed: false, retryAfter };
+  }
+
+  attempts.push(now);
+  return { allowed: true };
+}
+
+function sweepRateLimits() {
+  const now = Date.now();
+  for (const [ip, attempts] of registrationRateLimits.entries()) {
+    const valid = Array.isArray(attempts) ? attempts.filter(ts => (now - ts) < REGISTRATION_WINDOW_MS) : [];
+    if (valid.length === 0) {
+      registrationRateLimits.delete(ip);
+    } else {
+      registrationRateLimits.set(ip, valid);
+    }
+  }
+
+  for (const [key, record] of loginRateLimits.entries()) {
+    if (!record) {
+      loginRateLimits.delete(key);
+      continue;
+    }
+    if (record.lockUntil > 0 && now >= record.lockUntil) {
+      record.lockUntil = 0;
+    }
+    const isLocked = record.lockUntil > 0 && now < record.lockUntil;
+    const validAttempts = Array.isArray(record.attempts)
+      ? record.attempts.filter(ts => (now - ts) < LOGIN_WINDOW_MS)
+      : [];
+    if (!isLocked && validAttempts.length === 0) {
+      loginRateLimits.delete(key);
+    } else {
+      record.attempts = validAttempts;
+      record.failures = validAttempts.length;
+    }
+  }
+}
+
+const rateLimitSweepTimer = setInterval(sweepRateLimits, 60_000);
+if (typeof rateLimitSweepTimer.unref === 'function') {
+  rateLimitSweepTimer.unref();
+}
+
+function getSessionTtlMs() {
+  const envTtl = process.env.SESSION_TTL_MINUTES;
+  let ttlMinutes = 30;
+  if (envTtl !== undefined && envTtl !== null && String(envTtl).trim() !== '') {
+    const parsed = Number(String(envTtl).trim());
+    if (Number.isFinite(parsed) && parsed > 0) {
+      ttlMinutes = parsed;
+    }
+  }
+  return ttlMinutes * 60 * 1000;
+}
+
+function sweepExpiredSessions() {
+  const now = Date.now();
+  const ttlMs = getSessionTtlMs();
+  for (const [token, session] of sessions.entries()) {
+    if (!session || !session.loginTime || (now - session.loginTime > ttlMs)) {
+      sessions.delete(token);
+    }
+  }
+}
+
+const sessionCleanupTimer = setInterval(sweepExpiredSessions, 10 * 60 * 1000);
+if (typeof sessionCleanupTimer.unref === 'function') {
+  sessionCleanupTimer.unref();
+}
 
 function sanitizeLogField(val) {
   return String(val === undefined || val === null ? '' : val)
@@ -92,6 +194,56 @@ function normalizeRole(role) {
   return null;
 }
 
+function getUserQuota(role) {
+  const normalized = normalizeRole(role);
+  if (normalized && Object.prototype.hasOwnProperty.call(STORAGE_QUOTAS, normalized)) {
+    return STORAGE_QUOTAS[normalized];
+  }
+  return STORAGE_QUOTAS.Student;
+}
+
+function getUserStorageUsage(username) {
+  const clean = String(username || '').trim().toLowerCase();
+  let total = 0;
+  if (db && db.files && typeof db.files === 'object') {
+    for (const [fileId, file] of Object.entries(db.files)) {
+      if (file && typeof file === 'object' && String(file.owner || '').trim().toLowerCase() === clean) {
+        const rawSize = file.size;
+        if (
+          rawSize === undefined ||
+          rawSize === null ||
+          typeof rawSize !== 'number' ||
+          !Number.isInteger(rawSize) ||
+          rawSize < 0 ||
+          !Number.isSafeInteger(rawSize)
+        ) {
+          const err = new Error(`Authoritative metadata contains invalid file size for file ${fileId}.`);
+          err.code = 'INVALID_METADATA';
+          err.statusCode = 500;
+          throw err;
+        }
+        total += rawSize;
+      }
+    }
+  }
+  return total;
+}
+
+function getInflightBytes(username) {
+  return inflightUploads.get(username) || 0;
+}
+
+function addInflightBytes(username, bytes) {
+  inflightUploads.set(username, getInflightBytes(username) + bytes);
+}
+
+function releaseInflightBytes(username, bytes) {
+  const cur = getInflightBytes(username);
+  const rem = Math.max(0, cur - bytes);
+  if (rem === 0) inflightUploads.delete(username);
+  else inflightUploads.set(username, rem);
+}
+
 function validateNewAccount(username, password) {
   const cleanUsername = String(username || '').trim().toLowerCase();
   if (!cleanUsername || cleanUsername.length < 2 || cleanUsername.length > 30) {
@@ -137,6 +289,9 @@ function send(res, status, data, type = 'application/json; charset=utf-8', extra
     'content-length': Buffer.byteLength(body),
     'x-content-type-options': 'nosniff',
     'cache-control': 'no-store',
+    'content-security-policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'",
+    'x-frame-options': 'DENY',
+    'referrer-policy': 'no-referrer',
     ...extraHeaders
   });
   res.end(body);
@@ -180,15 +335,7 @@ function userFor(req) {
   if (!session) return null;
 
   // Session TTL check (default 30 minutes, configurable via SESSION_TTL_MINUTES)
-  const envTtl = process.env.SESSION_TTL_MINUTES;
-  let ttlMinutes = 30;
-  if (envTtl !== undefined && envTtl !== null && String(envTtl).trim() !== '') {
-    const parsed = Number(String(envTtl).trim());
-    if (Number.isFinite(parsed) && parsed > 0) {
-      ttlMinutes = parsed;
-    }
-  }
-  const ttlMs = ttlMinutes * 60 * 1000;
+  const ttlMs = getSessionTtlMs();
   if (Date.now() - session.loginTime > ttlMs) {
     sessions.delete(token);
     return null;
@@ -275,16 +422,28 @@ const requestHandler = async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/login') {
       const { username, password } = await readBody(req);
       const cleanUsername = String(username || '').trim().toLowerCase();
-      const clientIp = (req.socket && req.socket.remoteAddress) ? String(req.socket.remoteAddress).trim() : '127.0.0.1';
+      const clientIp = getClientIp(req);
       const rateLimitKey = `${cleanUsername}|${clientIp}`;
 
       const now = Date.now();
       let limitRecord = loginRateLimits.get(rateLimitKey);
 
-      // Clean up expired lock entries safely
+      // Reset expired lockout without erasing unexpired attempt timestamps
       if (limitRecord && limitRecord.lockUntil > 0 && now >= limitRecord.lockUntil) {
-        loginRateLimits.delete(rateLimitKey);
-        limitRecord = undefined;
+        limitRecord.lockUntil = 0;
+      }
+
+      // Slide the 15-minute window over failed attempts
+      if (limitRecord) {
+        const validAttempts = Array.isArray(limitRecord.attempts)
+          ? limitRecord.attempts.filter(ts => (now - ts) < LOGIN_WINDOW_MS)
+          : [];
+        limitRecord.attempts = validAttempts;
+        limitRecord.failures = validAttempts.length;
+        if (limitRecord.lockUntil === 0 && validAttempts.length === 0) {
+          loginRateLimits.delete(rateLimitKey);
+          limitRecord = undefined;
+        }
       }
 
       // Check the lock BEFORE running the scrypt password comparison
@@ -300,9 +459,15 @@ const requestHandler = async (req, res) => {
 
       if (!record) {
         // Track failed attempt (rate-limits unknown usernames identically without enumeration)
-        const currentFailures = (limitRecord ? limitRecord.failures : 0) + 1;
-        const lockUntil = currentFailures >= 5 ? now + 60_000 : 0;
-        loginRateLimits.set(rateLimitKey, { failures: currentFailures, lockUntil });
+        if (!limitRecord) {
+          limitRecord = { attempts: [], failures: 0, lockUntil: 0 };
+          loginRateLimits.set(rateLimitKey, limitRecord);
+        }
+        if (!Array.isArray(limitRecord.attempts)) limitRecord.attempts = [];
+        limitRecord.attempts = limitRecord.attempts.filter(ts => (now - ts) < LOGIN_WINDOW_MS);
+        limitRecord.attempts.push(now);
+        limitRecord.failures = limitRecord.attempts.length;
+        limitRecord.lockUntil = limitRecord.failures >= 5 ? now + 60_000 : 0;
 
         logEvent('DENY', 'login', `user=${cleanUsername || 'anonymous'} (user not found)`);
         return fail(res, 401, 'Incorrect username or password.');
@@ -313,9 +478,15 @@ const requestHandler = async (req, res) => {
 
       if (!crypto.timingSafeEqual(inputHash, expectedHash)) {
         // Track failed attempt for invalid password
-        const currentFailures = (limitRecord ? limitRecord.failures : 0) + 1;
-        const lockUntil = currentFailures >= 5 ? now + 60_000 : 0;
-        loginRateLimits.set(rateLimitKey, { failures: currentFailures, lockUntil });
+        if (!limitRecord) {
+          limitRecord = { attempts: [], failures: 0, lockUntil: 0 };
+          loginRateLimits.set(rateLimitKey, limitRecord);
+        }
+        if (!Array.isArray(limitRecord.attempts)) limitRecord.attempts = [];
+        limitRecord.attempts = limitRecord.attempts.filter(ts => (now - ts) < LOGIN_WINDOW_MS);
+        limitRecord.attempts.push(now);
+        limitRecord.failures = limitRecord.attempts.length;
+        limitRecord.lockUntil = limitRecord.failures >= 5 ? now + 60_000 : 0;
 
         logEvent('DENY', 'login', `user=${cleanUsername} (invalid password)`);
         return fail(res, 401, 'Incorrect username or password.');
@@ -327,11 +498,36 @@ const requestHandler = async (req, res) => {
       const token = crypto.randomBytes(32).toString('hex');
       sessions.set(token, { username: cleanUsername, role: record.role, loginTime: Date.now() });
       logEvent('ALLOW', 'login', `user=${cleanUsername} role=${record.role}`);
-      return send(res, 200, { token, username: cleanUsername, role: record.role });
+      const quota = getUserQuota(record.role);
+      let usage = null;
+      try {
+        usage = getUserStorageUsage(cleanUsername);
+      } catch {
+        usage = null;
+      }
+      return send(res, 200, {
+        token,
+        username: cleanUsername,
+        role: record.role,
+        quota: quota === Infinity ? 'unlimited' : quota,
+        usage
+      });
     }
 
     // Authentication: Register new user (Student-only self-registration)
     if (req.method === 'POST' && url.pathname === '/api/register') {
+      const clientIp = getClientIp(req);
+      const regLimit = checkRegistrationRateLimit(clientIp);
+      if (!regLimit.allowed) {
+        logEvent('DENY', 'register', `ip=${clientIp} (registration rate limit exceeded)`);
+        if (typeof res.setHeader === 'function') {
+          res.setHeader('retry-after', String(regLimit.retryAfter));
+        }
+        return fail(res, 429, 'Too many registration attempts. Please try again later.', {
+          'retry-after': String(regLimit.retryAfter)
+        });
+      }
+
       if (String(process.env.ALLOW_PUBLIC_REGISTRATION || '').trim().toLowerCase() === 'false') {
         logEvent('DENY', 'register', 'public registration disabled (ALLOW_PUBLIC_REGISTRATION=false)');
         return fail(res, 403, 'Public registration is currently disabled.');
@@ -368,10 +564,19 @@ const requestHandler = async (req, res) => {
       sessions.set(token, { username: cleanUsername, role: 'Student', loginTime: Date.now() });
 
       logEvent('ALLOW', 'register', `user=${cleanUsername} role=Student`);
+      const quota = getUserQuota('Student');
+      let usage = 0;
+      try {
+        usage = getUserStorageUsage(cleanUsername);
+      } catch {
+        usage = null;
+      }
       return send(res, 201, {
         token,
         username: cleanUsername,
         role: 'Student',
+        quota: quota === Infinity ? 'unlimited' : quota,
+        usage,
         message: `Account created successfully for ${cleanUsername}.`
       });
     }
@@ -499,7 +704,19 @@ const requestHandler = async (req, res) => {
 
     // Current user info
     if (req.method === 'GET' && url.pathname === '/api/me') {
-      return send(res, 200, { username: user.username, role: user.role });
+      const quota = getUserQuota(user.role);
+      let usage = null;
+      try {
+        usage = getUserStorageUsage(user.username);
+      } catch {
+        usage = null;
+      }
+      return send(res, 200, {
+        username: user.username,
+        role: user.role,
+        quota: quota === Infinity ? 'unlimited' : quota,
+        usage
+      });
     }
 
     // List available files and directory of users
@@ -509,8 +726,20 @@ const requestHandler = async (req, res) => {
         username: uname,
         role: u.role
       }));
+      const quota = getUserQuota(user.role);
+      let usage = null;
+      try {
+        usage = getUserStorageUsage(user.username);
+      } catch {
+        usage = null;
+      }
       logEvent('ALLOW', 'list-files', `user=${user.username} visible=${visibleFiles.length}`);
-      return send(res, 200, { files: visibleFiles, users: allUsers });
+      return send(res, 200, {
+        files: visibleFiles,
+        users: allUsers,
+        quota: quota === Infinity ? 'unlimited' : quota,
+        usage
+      });
     }
 
     // Upload file
@@ -527,36 +756,79 @@ const requestHandler = async (req, res) => {
         return fail(res, 400, 'File exceeds maximum size limit of 10 MB.');
       }
 
-      // Compute original file digest before encryption
-      const sha256 = crypto.createHash('sha256').update(plain).digest('hex');
-      const id = crypto.randomUUID();
-      const diskName = `${id}.aes`;
+      // Role-based storage quota check
+      const quota = getUserQuota(user.role);
+      let currentUsage;
+      try {
+        currentUsage = getUserStorageUsage(user.username);
+      } catch (metaErr) {
+        logEvent('DENY', 'upload', `user=${user.username} file=${cleanName(name)} (metadata integrity error: failed to verify storage usage)`);
+        return fail(res, 500, 'Storage quota verification failed due to invalid file metadata.');
+      }
+      const inFlight = getInflightBytes(user.username);
 
-      // Encrypt bytes using AES-256-GCM with fresh random IV
-      const sealed = encrypt(plain);
-      fs.writeFileSync(path.join(STORE, diskName), sealed.data);
+      if (quota !== Infinity && (currentUsage + inFlight + plain.length > quota)) {
+        logEvent('DENY', 'upload', `user=${user.username} file=${cleanName(name)} size=${plain.length}B (storage quota exceeded: used=${currentUsage}B in_flight=${inFlight}B limit=${quota}B)`);
+        return fail(res, 413, `Upload exceeds storage quota. Current usage: ${currentUsage} bytes, Quota: ${quota} bytes.`);
+      }
 
-      const record = {
-        id,
-        name: cleanName(name),
-        diskName,
-        iv: sealed.iv,
-        tag: sealed.tag,
-        owner: user.username,
-        ownerRole: user.role,
-        sharedWith: [],
-        size: plain.length,
-        sha256,
-        originalSha256: sha256,
-        createdAt: new Date().toISOString(),
-        tampered: false
-      };
+      addInflightBytes(user.username, plain.length);
+      let createdDiskPath = null;
+      let createdFileId = null;
+      try {
+        // Compute original file digest before encryption
+        const sha256 = crypto.createHash('sha256').update(plain).digest('hex');
+        const id = crypto.randomUUID();
+        const diskName = `${id}.aes`;
+        createdDiskPath = path.join(STORE, diskName);
+        createdFileId = id;
 
-      db.files[id] = record;
-      persist();
+        // Encrypt bytes using AES-256-GCM with fresh random IV
+        const sealed = encrypt(plain);
+        fs.writeFileSync(createdDiskPath, sealed.data);
 
-      logEvent('ALLOW', 'upload', `user=${user.username} file=${record.name} size=${plain.length}B sha256=${sha256}`);
-      return send(res, 201, { file: listFiles(user).find(f => f.id === id) });
+        const record = {
+          id,
+          name: cleanName(name),
+          diskName,
+          iv: sealed.iv,
+          tag: sealed.tag,
+          owner: user.username,
+          ownerRole: user.role,
+          sharedWith: [],
+          size: plain.length,
+          sha256,
+          originalSha256: sha256,
+          createdAt: new Date().toISOString(),
+          tampered: false
+        };
+
+        db.files[id] = record;
+        persist();
+
+        logEvent('ALLOW', 'upload', `user=${user.username} file=${record.name} size=${plain.length}B sha256=${sha256}`);
+        return send(res, 201, { file: listFiles(user).find(f => f.id === id) });
+      } catch (uploadErr) {
+        if (createdDiskPath && fs.existsSync(createdDiskPath)) {
+          try {
+            fs.unlinkSync(createdDiskPath);
+          } catch (unlinkErr) {
+            console.error('[ROLLBACK-ERROR] Failed to unlink orphaned ciphertext file:', unlinkErr);
+          }
+        }
+        if (createdFileId && db.files && db.files[createdFileId]) {
+          delete db.files[createdFileId];
+          try {
+            persist();
+          } catch (persistRollbackErr) {
+            console.error('[ROLLBACK-ERROR] Failed to persist metadata after rollback:', persistRollbackErr);
+          }
+        }
+        logEvent('DENY', 'upload', `user=${user.username} file=${cleanName(name)} (upload transaction failed and rolled back)`);
+        throw uploadErr;
+      } finally {
+        releaseInflightBytes(user.username, plain.length);
+      }
     }
 
     // File-specific operations: share, revoke, download, tamper-demo, delete
@@ -729,12 +1001,12 @@ const requestHandler = async (req, res) => {
 
     return fail(res, 404, 'Endpoint not found.');
   } catch (error) {
-    if (error.statusCode === 400 || error.statusCode === 413) {
+    if (error.statusCode && error.statusCode >= 400 && error.statusCode < 500) {
       logEvent('DENY', 'bad-request', `error=${error.message}`);
       return fail(res, error.statusCode, error.message);
     }
     console.error('[SERVER-ERROR]', error);
-    return fail(res, 500, error.message || 'Internal server error.');
+    return fail(res, 500, 'Internal server error.');
   }
 };
 
@@ -774,6 +1046,16 @@ module.exports = {
   db,
   sessions,
   loginRateLimits,
+  registrationRateLimits,
+  inflightUploads,
+  getInflightBytes,
+  sweepRateLimits,
+  sweepExpiredSessions,
+  getUserQuota,
+  getUserStorageUsage,
+  STORAGE_QUOTAS,
+  getClientIp,
+  checkRegistrationRateLimit,
   logEvent,
   persist,
   seedUser,
