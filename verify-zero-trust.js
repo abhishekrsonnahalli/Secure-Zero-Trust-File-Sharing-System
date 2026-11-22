@@ -7,6 +7,8 @@ const os = require('node:os');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const https = require('node:https');
+const tls = require('node:tls');
 const { Readable } = require('node:stream');
 
 // Configure isolated temporary test storage so real storage/ data is NEVER modified
@@ -29,8 +31,11 @@ const {
   createUser,
   listFiles,
   persist,
-  STORE
+  STORE,
+  createAppServer
 } = require('./server');
+
+const { generateCert, findOpenSSL } = require('./gen-cert');
 
 function dispatch({ method = 'GET', path: reqPath = '/', headers = {}, body = null, isHttps = false, remoteAddress = '127.0.0.1' }) {
   return new Promise((resolve, reject) => {
@@ -66,6 +71,8 @@ function dispatch({ method = 'GET', path: reqPath = '/', headers = {}, body = nu
     let responseBody = '';
 
     const res = {
+      socket: req.socket,
+      req,
       writeHead(code, hdrs) {
         statusCode = code;
         resHeaders = { ...resHeaders, ...hdrs };
@@ -1635,6 +1642,302 @@ async function runTestSuite() {
     const check16Passed = finding1Passed && finding2Passed && finding3Passed;
     record(16, 'Code Review Corrections: Sliding Window Persistence, Fail-Closed Quotas & Upload Rollback', check16Passed,
       `Finding 1: Failed login attempts survived lockout expiration until 15m window decayed; immediate re-lock confirmed; cleared on success. Finding 2: Malformed metadata (negative/float/null/string/NaN) failed closed with HTTP 500; valid quota enforcement intact. Finding 3: Persistence failure after ciphertext creation triggered automatic transactional rollback (0 orphaned files, restored metadata, freed in-flight quota bytes).`);
+
+    // ---------------------------------------------------------
+    // Check 17: Optional HTTPS/TLS Support, EC P-256 Certificates, Fail-Loud Behavior & HSTS
+    // ---------------------------------------------------------
+    const tlsTestDir = path.join(TEST_STORAGE_DIR, 'tls-test');
+    fs.mkdirSync(tlsTestDir, { recursive: true });
+
+    // 1. Certificate generation using OpenSSL CLI
+    const genRes = generateCert({ outDir: tlsTestDir, force: true, silent: true });
+    const certCreated = genRes.generated && fs.existsSync(genRes.certPath) && fs.existsSync(genRes.keyPath);
+
+    // 2. Validate certificate properties (EC P-256, 365 days, SAN for localhost & 127.0.0.1)
+    const certBuf = fs.readFileSync(genRes.certPath);
+    const x509 = new crypto.X509Certificate(certBuf);
+    const isEcKey = x509.publicKey.asymmetricKeyType === 'ec';
+    const isLocalhostSubject = x509.subject.includes('CN=localhost');
+    const hasSanDns = x509.subjectAltName && x509.subjectAltName.includes('DNS:localhost');
+    const hasSanIp = x509.subjectAltName && x509.subjectAltName.includes('IP Address:127.0.0.1');
+    const validDays = Math.round((new Date(x509.validTo) - new Date(x509.validFrom)) / (24 * 3600 * 1000));
+    const isValid365 = validDays >= 364 && validDays <= 366;
+    const certPropsValid = isEcKey && isLocalhostSubject && hasSanDns && hasSanIp && isValid365;
+
+    // 3. Preservation of complete pairs vs rejection of incomplete pairs
+    const certStatsBefore = fs.statSync(genRes.certPath);
+    const preserveRes = generateCert({ outDir: tlsTestDir, force: false, silent: true });
+    const certStatsAfterPreserve = fs.statSync(genRes.certPath);
+    const completePairPreserved = preserveRes.preserved &&
+                                  !preserveRes.generated &&
+                                  certStatsBefore.mtimeMs === certStatsAfterPreserve.mtimeMs;
+
+    // Incomplete pair must NOT be reported as preserved; must fail clearly with instructions for --force
+    const incompleteDir = path.join(tlsTestDir, 'incomplete-pair');
+    fs.mkdirSync(incompleteDir, { recursive: true });
+    fs.writeFileSync(path.join(incompleteDir, 'cert.pem'), fs.readFileSync(genRes.certPath));
+    let incompleteFailedClearly = false;
+    try {
+      generateCert({ outDir: incompleteDir, force: false, silent: true });
+    } catch (err) {
+      incompleteFailedClearly = err &&
+                                err.code === 'ERR_TLS_PAIR_INCOMPLETE' &&
+                                err.message.includes('--force');
+    }
+
+    // 4. Fail-loud when USE_HTTPS=true and certificates are missing, corrupt, or mismatched
+    let missingCertFailedLoud = false;
+    try {
+      createAppServer({ useHttps: true, certFile: path.join(tlsTestDir, 'nonexistent-cert.pem'), keyFile: genRes.keyPath });
+    } catch (err) {
+      missingCertFailedLoud = err && err.code === 'ERR_HTTPS_CERT_MISSING';
+    }
+
+    let missingKeyFailedLoud = false;
+    try {
+      createAppServer({ useHttps: true, certFile: genRes.certPath, keyFile: path.join(tlsTestDir, 'nonexistent-key.pem') });
+    } catch (err) {
+      missingKeyFailedLoud = err && err.code === 'ERR_HTTPS_KEY_MISSING';
+    }
+
+    const corruptKeyPath = path.join(tlsTestDir, 'corrupt-key.pem');
+    fs.writeFileSync(corruptKeyPath, '-----BEGIN PRIVATE KEY-----\nINVALID_KEY_DATA\n-----END PRIVATE KEY-----');
+    let corruptKeyFailedLoud = false;
+    try {
+      createAppServer({ useHttps: true, certFile: genRes.certPath, keyFile: corruptKeyPath });
+    } catch (err) {
+      corruptKeyFailedLoud = err && err.code === 'ERR_HTTPS_KEY_INVALID';
+    }
+
+    const corruptCertPath = path.join(tlsTestDir, 'corrupt-cert.pem');
+    fs.writeFileSync(corruptCertPath, 'NOT_A_PEM_CERTIFICATE_CONTENT');
+    let corruptCertFailedLoud = false;
+    try {
+      createAppServer({ useHttps: true, certFile: corruptCertPath, keyFile: genRes.keyPath });
+    } catch (err) {
+      corruptCertFailedLoud = err && err.code === 'ERR_HTTPS_CERT_INVALID';
+    }
+
+    // Mismatched certificate and private key from two individually valid but unrelated pairs
+    const pair2Dir = path.join(tlsTestDir, 'pair2');
+    const p2Res = generateCert({ outDir: pair2Dir, force: true, silent: true });
+    let mismatchedFailedLoud = false;
+    try {
+      createAppServer({
+        useHttps: true,
+        certFile: genRes.certPath, // Pair 1 cert
+        keyFile: p2Res.keyPath     // Pair 2 key
+      });
+    } catch (err) {
+      mismatchedFailedLoud = err &&
+        (err.code === 'ERR_HTTPS_KEY_CERT_MISMATCH' || err.message.includes('mismatched') || err.message.includes('do not match'));
+    }
+
+    const failLoudAllPassed = missingCertFailedLoud && missingKeyFailedLoud &&
+                              corruptKeyFailedLoud && corruptCertFailedLoud && mismatchedFailedLoud;
+
+    // 5. Enforce TLS minimum version 1.2 with real live TLS handshake on ephemeral port
+    const validHttpsServer = createAppServer({
+      useHttps: true,
+      certFile: genRes.certPath,
+      keyFile: genRes.keyPath
+    });
+    const minVersionConfigured = validHttpsServer.protocol === 'https' &&
+                                 validHttpsServer.minVersion === 'TLSv1.2';
+
+    let liveHandshakeTls12Ok = false;
+    let serverQualifyingRejection = false;
+    let serverTlsClientErrorCode = '';
+    let tls11Outcome = 'unknown';
+    let httpsAuthOk = false;
+    let clientTls11Error = null;
+
+    let resolveServerEvent;
+    const serverEventPromise = new Promise((resolve) => { resolveServerEvent = resolve; });
+
+    const httpsLiveServer = validHttpsServer.server;
+    try {
+      httpsLiveServer.on('tlsClientError', (err) => {
+        const code = err.code || '';
+        const msg = String(err.message || '').toLowerCase();
+        const isProtocolVersionError = code === 'ERR_SSL_UNSUPPORTED_PROTOCOL' ||
+                                      msg.includes('unsupported protocol') ||
+                                      msg.includes('protocol version') ||
+                                      msg.includes('alert protocol version');
+        if (isProtocolVersionError) {
+          serverQualifyingRejection = true;
+          serverTlsClientErrorCode = code || 'ERR_SSL_UNSUPPORTED_PROTOCOL';
+          resolveServerEvent(true);
+        }
+      });
+
+      await new Promise((resolve, reject) => {
+        httpsLiveServer.listen(0, '127.0.0.1', () => resolve());
+        httpsLiveServer.once('error', reject);
+      });
+      const livePort = httpsLiveServer.address().port;
+
+      function liveHttpsRequest(method, reqPath, reqHeaders = {}, reqBody = null) {
+        return new Promise((resolve, reject) => {
+          let payload = reqBody ? (typeof reqBody === 'string' ? reqBody : JSON.stringify(reqBody)) : null;
+          const headers = {
+            host: `127.0.0.1:${livePort}`,
+            ...(payload ? { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(payload)) } : {}),
+            ...reqHeaders
+          };
+          const req = https.request({
+            host: '127.0.0.1',
+            port: livePort,
+            path: reqPath,
+            method,
+            headers,
+            rejectUnauthorized: false,
+            minVersion: 'TLSv1.2'
+          }, (res) => {
+            let buf = '';
+            res.on('data', chunk => buf += chunk);
+            res.on('end', () => {
+              let json = {};
+              try { json = buf ? JSON.parse(buf) : {}; } catch { json = { raw: buf }; }
+              resolve({
+                status: res.statusCode,
+                headers: res.headers,
+                data: json
+              });
+            });
+          });
+          req.on('error', reject);
+          if (payload) req.write(payload);
+          req.end();
+        });
+      }
+
+      // Real HTTPS request over TLS 1.2+ must succeed and return HSTS
+      const liveTransportRes = await liveHttpsRequest('GET', '/api/transport');
+      liveHandshakeTls12Ok = liveTransportRes.status === 200 &&
+                             liveTransportRes.data.protocol === 'https' &&
+                             liveTransportRes.data.isTls === true &&
+                             liveTransportRes.headers['strict-transport-security'] === 'max-age=31536000; includeSubDomains';
+
+      // Real HTTPS login and authenticated /api/me through the live HTTPS server
+      const liveLoginRes = await liveHttpsRequest('POST', '/api/login', {}, { username: 'asha', password: 'asha123' });
+      const liveLoginOk = liveLoginRes.status === 200 &&
+                          typeof liveLoginRes.data.token === 'string' &&
+                          liveLoginRes.headers['strict-transport-security'] === 'max-age=31536000; includeSubDomains';
+
+      const liveMeRes = await liveHttpsRequest('GET', '/api/me', { authorization: `Bearer ${liveLoginRes.data.token}` });
+      const liveMeOk = liveMeRes.status === 200 &&
+                       liveMeRes.data.username === 'asha' &&
+                       liveMeRes.headers['strict-transport-security'] === 'max-age=31536000; includeSubDomains';
+
+      httpsAuthOk = liveLoginOk && liveMeOk;
+
+      // Client attempting TLS 1.1 with explicit minVersion and maxVersion
+      let tcpConnected = false;
+      let tlsHandshakeSucceeded = false;
+      let resolveClient;
+      const clientPromise = new Promise((resolve) => { resolveClient = resolve; });
+
+      const sock = tls.connect({
+        host: '127.0.0.1',
+        port: livePort,
+        rejectUnauthorized: false,
+        minVersion: 'TLSv1.1',
+        maxVersion: 'TLSv1.1',
+        ciphers: 'DEFAULT:@SECLEVEL=0'
+      });
+
+      sock.on('connect', () => {
+        tcpConnected = true;
+      });
+
+      sock.on('secureConnect', () => {
+        tlsHandshakeSucceeded = true;
+        sock.destroy();
+        resolveClient();
+      });
+
+      sock.on('error', (err) => {
+        clientTls11Error = err;
+        resolveClient();
+      });
+
+      // Bounded wait for client completion and server-side qualifying rejection (max 2000ms timeout)
+      const timeoutPromise = new Promise((resolve) => setTimeout(() => resolve(false), 2000));
+      await Promise.all([clientPromise, Promise.race([serverEventPromise, timeoutPromise])]);
+
+      const RECOGNIZED_LOCAL_CAPABILITY_ERRORS = [
+        'ERR_SSL_NO_PROTOCOLS_AVAILABLE',
+        'ERR_TLS_INVALID_PROTOCOL_VERSION',
+        'ERR_SSL_UNSUPPORTED_PROTOCOL',
+        'ERR_OSSL_EVP_UNSUPPORTED'
+      ];
+
+      if (tlsHandshakeSucceeded) {
+        tls11Outcome = 'failed';
+      } else if (tcpConnected) {
+        // If TCP connected, server MUST emit qualifying protocol rejection event
+        if (serverQualifyingRejection) {
+          tls11Outcome = 'verified_server_rejection';
+        } else {
+          // TCP connected but no qualifying server rejection occurred -> fail test
+          tls11Outcome = 'failed';
+        }
+      } else {
+        // If TCP did not connect, verify it failed due to recognized local capability error
+        if (clientTls11Error && RECOGNIZED_LOCAL_CAPABILITY_ERRORS.includes(clientTls11Error.code)) {
+          tls11Outcome = 'runtime_cannot_offer_tls11';
+        } else {
+          // Unknown error before TCP connection fails the test
+          tls11Outcome = 'failed';
+        }
+      }
+    } finally {
+      if (httpsLiveServer && httpsLiveServer.listening) {
+        await new Promise((resolve) => httpsLiveServer.close(resolve));
+      }
+    }
+
+    const minVersionHandshakeEnforced = minVersionConfigured &&
+                                        liveHandshakeTls12Ok &&
+                                        (tls11Outcome === 'verified_server_rejection' || tls11Outcome === 'runtime_cannot_offer_tls11');
+
+    // 6. Apply HSTS only when HTTPS is active
+    const httpHomeRes = await dispatch({ path: '/', isHttps: false });
+    const hstsAbsentOnHttp = httpHomeRes.headers['strict-transport-security'] === undefined;
+
+    const httpsHomeRes = await dispatch({ path: '/', isHttps: true });
+    const hstsPresentOnHttps = httpsHomeRes.headers['strict-transport-security'] === 'max-age=31536000; includeSubDomains';
+    const hstsCorrect = hstsAbsentOnHttp && hstsPresentOnHttps;
+
+    // 7. Display actual server URL and transport mode in /api/transport
+    const transportHttpRes = await dispatch({ path: '/api/transport', isHttps: false });
+    const transportHttpOk = transportHttpRes.data.protocol === 'http' &&
+                            transportHttpRes.data.isTls === false &&
+                            transportHttpRes.data.url === 'http://127.0.0.1:4173' &&
+                            transportHttpRes.data.mode === 'HTTP (Plaintext Local)';
+
+    const transportHttpsRes = await dispatch({ path: '/api/transport', isHttps: true });
+    const transportHttpsOk = transportHttpsRes.data.protocol === 'https' &&
+                             transportHttpsRes.data.isTls === true &&
+                             transportHttpsRes.data.url === 'https://127.0.0.1:4173' &&
+                             transportHttpsRes.data.mode === 'HTTPS (TLS v1.2+)';
+
+    const transportModeOk = transportHttpOk && transportHttpsOk;
+
+    const tls11Summary = tls11Outcome === 'verified_server_rejection'
+      ? `server-side rejection genuinely verified (TCP connected; server triggered qualifying tlsClientError [${serverTlsClientErrorCode}])`
+      : (tls11Outcome === 'runtime_cannot_offer_tls11'
+        ? `local Node/OpenSSL runtime cannot offer TLS 1.1 on client (${clientTls11Error?.code}; reported runtime limitation)`
+        : `FAILED (TLS 1.1 was not properly rejected)`);
+
+    const check17Passed = certCreated && certPropsValid && completePairPreserved &&
+                          incompleteFailedClearly && failLoudAllPassed &&
+                          minVersionHandshakeEnforced && hstsCorrect &&
+                          transportModeOk && httpsAuthOk;
+
+    record(17, 'Optional HTTPS/TLS: EC P-256 cert generator, fail-loud missing certs, TLS 1.2+, and HTTPS-only HSTS', check17Passed,
+      `gen-cert.js generated self-signed EC P-256 certificate with SAN (DNS:localhost, IP:127.0.0.1) valid 365 days; existing complete certs preserved, incomplete pairs fail clearly unless --force. Server failed loudly when certificates missing, corrupt, or mismatched (never fell back to HTTP). Minimum TLS version 1.2 handshake enforced (real TLS 1.2+ succeeded; TLS 1.1 ${tls11Summary}; server closed in all outcomes). Real HTTPS login and /api/me verified over live TLS server with HSTS ("${httpsHomeRes.headers['strict-transport-security']}"). Transport URL and mode reported correctly for HTTP and HTTPS.`);
 
   } catch (err) {
     console.error('Test suite encountered an unexpected error:', err);

@@ -754,7 +754,13 @@ if (adminRefreshBtn) {
     const t = await api('/api/transport');
     const badge = $('#transportBadge');
     if (badge) {
-      badge.textContent = `● LOCAL ONLY · ${t.protocol.toUpperCase()} ${t.host}:${t.port}`;
+      if (t.isTls || t.protocol === 'https') {
+        badge.textContent = `🔒 SECURE · HTTPS ${t.host}:${t.port}`;
+        badge.title = `Mode: ${t.mode || 'HTTPS (TLS v1.2+)'} · URL: ${t.url || 'https://' + t.host + ':' + t.port}`;
+      } else {
+        badge.textContent = `● LOCAL ONLY · HTTP ${t.host}:${t.port}`;
+        badge.title = `Mode: ${t.mode || 'HTTP (Plaintext Local)'} · URL: ${t.url || 'http://' + t.host + ':' + t.port}`;
+      }
     }
   } catch {}
 })();

@@ -284,6 +284,11 @@ persist();
 
 function send(res, status, data, type = 'application/json; charset=utf-8', extraHeaders = {}) {
   const body = type.startsWith('application/json') ? JSON.stringify(data) : data;
+  const isEncrypted = Boolean(
+    (res.socket && res.socket.encrypted) ||
+    (res.req && res.req.socket && res.req.socket.encrypted)
+  );
+
   res.writeHead(status, {
     'content-type': type,
     'content-length': Buffer.byteLength(body),
@@ -292,6 +297,7 @@ function send(res, status, data, type = 'application/json; charset=utf-8', extra
     'content-security-policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'",
     'x-frame-options': 'DENY',
     'referrer-policy': 'no-referrer',
+    ...(isEncrypted ? { 'strict-transport-security': 'max-age=31536000; includeSubDomains' } : {}),
     ...extraHeaders
   });
   res.end(body);
@@ -583,11 +589,15 @@ const requestHandler = async (req, res) => {
 
     // Transport info
     if (req.method === 'GET' && url.pathname === '/api/transport') {
+      const isEncrypted = Boolean(req.socket.encrypted);
+      const activeProto = isEncrypted ? 'https' : 'http';
       return send(res, 200, {
-        protocol,
-        isTls: Boolean(req.socket.encrypted),
+        protocol: activeProto,
+        isTls: isEncrypted,
         host: HOST,
-        port: PORT
+        port: PORT,
+        url: `${activeProto}://${HOST}:${PORT}`,
+        mode: isEncrypted ? 'HTTPS (TLS v1.2+)' : 'HTTP (Plaintext Local)'
       });
     }
 
@@ -1015,24 +1025,112 @@ const USE_HTTPS = process.env.USE_HTTPS === 'true' || process.env.HTTPS === 'tru
 const CERT_FILE = process.env.SSL_CERT || path.join(STORE, 'cert.pem');
 const SSL_KEY_FILE = process.env.SSL_KEY || path.join(STORE, 'key.pem');
 
-let server;
-let protocol = 'http';
+function createAppServer(options = {}) {
+  const useHttps = options.useHttps !== undefined
+    ? Boolean(options.useHttps)
+    : (process.env.USE_HTTPS === 'true' || process.env.HTTPS === 'true');
+  const certFile = options.certFile || process.env.SSL_CERT || path.join(STORE, 'cert.pem');
+  const keyFile = options.keyFile || process.env.SSL_KEY || path.join(STORE, 'key.pem');
 
-if (USE_HTTPS && fs.existsSync(CERT_FILE) && fs.existsSync(SSL_KEY_FILE)) {
-  const httpsOptions = {
-    key: fs.readFileSync(SSL_KEY_FILE),
-    cert: fs.readFileSync(CERT_FILE)
+  if (useHttps) {
+    if (!fs.existsSync(certFile)) {
+      const err = new Error(
+        `[HTTPS-CONFIG-ERROR] HTTPS requested (USE_HTTPS=true), but SSL certificate file not found: ${certFile}. ` +
+        `Run "node gen-cert.js" to generate a self-signed EC P-256 certificate, or set the SSL_CERT environment variable.`
+      );
+      err.code = 'ERR_HTTPS_CERT_MISSING';
+      throw err;
+    }
+    if (!fs.existsSync(keyFile)) {
+      const err = new Error(
+        `[HTTPS-CONFIG-ERROR] HTTPS requested (USE_HTTPS=true), but SSL private key file not found: ${keyFile}. ` +
+        `Run "node gen-cert.js" to generate a self-signed EC P-256 certificate, or set the SSL_KEY environment variable.`
+      );
+      err.code = 'ERR_HTTPS_KEY_MISSING';
+      throw err;
+    }
+
+    let certData;
+    let keyData;
+    try {
+      certData = fs.readFileSync(certFile);
+      keyData = fs.readFileSync(keyFile);
+    } catch (readErr) {
+      const err = new Error(`[HTTPS-CONFIG-ERROR] Failed to read certificate or key file: ${readErr.message}`);
+      err.code = 'ERR_HTTPS_FILE_READ';
+      throw err;
+    }
+
+    try {
+      crypto.createPrivateKey(keyData);
+    } catch (keyErr) {
+      const err = new Error(`[HTTPS-CONFIG-ERROR] SSL private key file is invalid or corrupt: ${keyErr.message}`);
+      err.code = 'ERR_HTTPS_KEY_INVALID';
+      throw err;
+    }
+
+    if (!certData.toString('utf8').includes('-----BEGIN CERTIFICATE-----')) {
+      const err = new Error(`[HTTPS-CONFIG-ERROR] SSL certificate file is invalid: missing PEM certificate header.`);
+      err.code = 'ERR_HTTPS_CERT_INVALID';
+      throw err;
+    }
+
+    const httpsOptions = {
+      key: keyData,
+      cert: certData,
+      minVersion: 'TLSv1.2'
+    };
+
+    let srv;
+    try {
+      srv = https.createServer(httpsOptions, requestHandler);
+    } catch (tlsErr) {
+      const err = new Error(
+        `[HTTPS-CONFIG-ERROR] SSL certificate and private key are invalid or mismatched: ${tlsErr.message}`
+      );
+      err.code = 'ERR_HTTPS_KEY_CERT_MISMATCH';
+      err.cause = tlsErr;
+      throw err;
+    }
+
+    return {
+      server: srv,
+      protocol: 'https',
+      minVersion: 'TLSv1.2',
+      certFile,
+      keyFile
+    };
+  }
+
+  const srv = http.createServer(requestHandler);
+  return {
+    server: srv,
+    protocol: 'http',
+    minVersion: null,
+    certFile: null,
+    keyFile: null
   };
-  server = https.createServer(httpsOptions, requestHandler);
-  protocol = 'https';
-} else {
-  server = http.createServer(requestHandler);
 }
+
+let serverConfig;
+try {
+  serverConfig = createAppServer();
+} catch (startupErr) {
+  if (require.main === module) {
+    console.error(startupErr.message);
+    process.exit(1);
+  }
+  throw startupErr;
+}
+
+const server = serverConfig.server;
+const protocol = serverConfig.protocol;
 
 if (require.main === module) {
   server.listen(PORT, HOST, () => {
     console.log(`=======================================================`);
     console.log(`Secure Zero-Trust File Sharing running at ${protocol}://${HOST}:${PORT}`);
+    console.log(`Transport Mode: ${protocol.toUpperCase()} (${protocol === 'https' ? 'TLS v1.2+ encrypted' : 'Local plain HTTP'})`);
     console.log(`Access Rules: DEFAULT DENY (Checked on every operation)`);
     console.log(`Demo Users: asha (Student), rao (Faculty), ravi (Student), admin (Admin)`);
     console.log(`Log format: [ALLOW] [DENY] [INTEGRITY-FAIL]`);
@@ -1042,6 +1140,11 @@ if (require.main === module) {
 
 module.exports = {
   server,
+  protocol,
+  createAppServer,
+  USE_HTTPS,
+  CERT_FILE,
+  SSL_KEY_FILE,
   requestHandler,
   db,
   sessions,

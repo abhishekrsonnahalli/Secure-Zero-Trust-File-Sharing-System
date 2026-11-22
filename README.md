@@ -133,14 +133,26 @@ To wipe uploaded demo files and reset storage while keeping demo accounts:
 
 ---
 
-## 6. Transport & Prototype Limitations
+## 6. Transport & Optional HTTPS/TLS Support
 
-- **Transport:** The server binds strictly to `127.0.0.1` (loopback) over HTTP. The UI displays **LOCAL ONLY · HTTP 127.0.0.1:4173** to make it explicit that traffic is not encrypted in transit. Do not expose this prototype to an external network or use real confidential data.
-- **Optional HTTPS Support:** `server.js` contains built-in HTTPS support. If you place `cert.pem` and `key.pem` into the `storage/` directory and run:
-  ```powershell
-  $env:USE_HTTPS="true"; node server.js
-  ```
-  The server will initialize an HTTPS listener. Because self-signed certificates trigger browser security warnings (`NET::ERR_CERT_AUTHORITY_INVALID`), HTTP on `127.0.0.1` is used as the default for clean demonstration.
+- **Default Transport:** By default, the server binds strictly to `127.0.0.1` (loopback) over HTTP. The UI displays **● LOCAL ONLY · HTTP 127.0.0.1:4173** to make it explicit that traffic is not encrypted in transit.
+- **Optional HTTPS / TLS Support:** The server includes optional local HTTPS support using a self-signed certificate via Node.js `node:https`.
+  - **Certificate Generation:** Use the provided `gen-cert.js` tool to generate an Elliptic Curve (EC P-256 / `prime256v1`) self-signed certificate with Subject Alternative Names (SAN) for `localhost` and `127.0.0.1`, valid for 365 days:
+    ```powershell
+    node gen-cert.js
+    ```
+    Existing certificates are never overwritten unless `--force` is supplied (`node gen-cert.js --force`).
+  - **Running in HTTPS Mode:**
+    - On Windows, double-click **`start-https.bat`** (or run `start-demo.bat --https`). It will automatically check for or generate certificates and launch your browser to `https://127.0.0.1:4173`.
+    - Or from PowerShell:
+      ```powershell
+      $env:USE_HTTPS="true"; node server.js
+      ```
+  - **Fail-Loud Configuration:** If `USE_HTTPS=true` and `storage/cert.pem` or `storage/key.pem` is missing, unreadable, or invalid, the server fails loudly with a descriptive startup error (`[HTTPS-CONFIG-ERROR]`). It **never silently falls back to plaintext HTTP**.
+  - **Enforced Minimum TLS Version:** The HTTPS server strictly requires **TLSv1.2** or higher (`minVersion: 'TLSv1.2'`). Legacy, insecure protocols (SSLv3, TLSv1.0, TLSv1.1) are rejected at the TLS handshake level.
+  - **HTTP Strict Transport Security (HSTS):** When HTTPS is active, the server automatically emits the `Strict-Transport-Security: max-age=31536000; includeSubDomains` header. HSTS is **only** applied when HTTPS is active; it is omitted over plain HTTP to prevent accidental lockouts on unencrypted origins.
+  - **Transport Indicators:** The frontend header badge automatically updates to **🔒 SECURE · HTTPS 127.0.0.1:4173** with hover tooltips indicating the active TLS mode and URL.
+  - **Browser Warnings on Self-Signed Certs:** Because self-signed certificates are not signed by a commercial Public Certificate Authority, browsers will display a one-time security warning (`NET::ERR_CERT_AUTHORITY_INVALID`). In the browser, click **Advanced** -> **Proceed to 127.0.0.1 (unsafe)** to view the application over TLS.
 - **Key Storage:** The master AES key is stored in `storage/.master-key`. In a production deployment, keys would be managed via a dedicated Hardware Security Module (HSM) or Key Management Service (KMS) rather than a local file.
 - **Sessions & Database:** Sessions and audit logs are stored in memory; file metadata is stored in a JSON file for classroom portability. Production systems require persistent databases with token rotation and rate limiting.
 
@@ -196,3 +208,4 @@ All required checks have been implemented and verified via `verify-zero-trust.js
 | **14** | Periodic session cleanup mechanism | **PASS** | `sweepExpiredSessions()` automatically purges expired tokens every 10 min without invalidating active sessions. |
 | **15** | Role-based storage quotas & atomic enforcement | **PASS** | Quotas enforced: Student (30 MB), Faculty (150 MB), Admin (Unlimited). Over-quota uploads rejected with HTTP 413. Shared files isolated from recipient quota. |
 | **16** | Code review corrections & transaction rollback | **PASS** | Failed login attempts persist across 60s lockout expiration until 15m window decays; immediate re-lock confirmed. Fail-closed quota calculation handles malformed sizes with HTTP 500. Persistence failure triggers automatic transactional rollback (0 orphaned files, clean metadata, released in-flight quota). |
+| **17** | Optional HTTPS/TLS & EC P-256 Certificates | **PASS** | `gen-cert.js` generates self-signed EC P-256 cert with SAN (localhost, 127.0.0.1) valid 365 days; preserves existing unless `--force`. Fail-loud on missing/invalid certs when `USE_HTTPS=true` (never falls back). Enforces TLS 1.2+ minimum. Applies HSTS only on HTTPS. |
